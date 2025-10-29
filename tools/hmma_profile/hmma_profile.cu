@@ -60,8 +60,8 @@ __managed__ uint64_t counter = 0;
 int batch_boundaries[100];
 int num_batches = 0;
 int current_batch = -1;  // ADDED: track current batch
-__managed__ bool batch_selected[100] = {false};
-__managed__ uint32_t total_selected = 0;
+__managed__ int batch_selected[100] = {0};  // int instead of bool
+__managed__ int total_selected = 0;         // int instead of uint32_t
 
 /* global control variables for this tool */
 uint32_t instr_begin_interval = 0;
@@ -91,20 +91,35 @@ bool is_tensor_instruction(Instr *instr) {
 
 /* ADDED: Check if kernel name suggests tensor operations */
 bool is_tensor_kernel(CUcontext ctx, CUfunction func) {
-    std::string kernel_name = nvbit_get_func_name(ctx, func);
-    std::transform(kernel_name.begin(), kernel_name.end(), kernel_name.begin(), ::tolower);
-    return kernel_name.find("conv") != std::string::npos ||
-           kernel_name.find("gemm") != std::string::npos ||
-           kernel_name.find("matmul") != std::string::npos ||
-           kernel_name.find("tensor") != std::string::npos ||
-           kernel_name.find("wmma") != std::string::npos ||
-           kernel_name.find("mma") != std::string::npos;
+    const char *kernel_name = nvbit_get_func_name(ctx, func);
+    if (!kernel_name) return false;
+    
+    // Use same patterns as working code
+    if (strstr(kernel_name, "implicit_gemm") != NULL) return true;
+    if (strstr(kernel_name, "implicit_convolve_sgemm") != NULL) return true;
+    if (strstr(kernel_name, "sm75_xmma_fprop_implicit_gemm") != NULL) return true;
+    
+    return false;
 }
 
 /* ADDED: Check if kernel is in batch and print batch starts */
+// bool is_in_batch(uint32_t kernel_id) {
+//     for (int i = 0; i < num_batches; i++) {
+//         uint32_t start = (i == 0) ? 753 : batch_boundaries[i-1] + 1;
+//         if (kernel_id >= start && kernel_id <= (uint32_t)batch_boundaries[i]) {
+//             if (current_batch != i) {
+//                 current_batch = i;
+//                 printf("*** BATCH %d STARTS: kernels %d-%d ***\n", i, start, batch_boundaries[i]);
+//             }
+//             return true;
+//         }
+//     }
+//     return false;
+// }
+
 bool is_in_batch(uint32_t kernel_id) {
     for (int i = 0; i < num_batches; i++) {
-        uint32_t start = (i == 0) ? 753 : batch_boundaries[i-1] + 1;
+        uint32_t start = (i == 0) ? 0 : batch_boundaries[i-1] + 1;  // Change 753 to 0
         if (kernel_id >= start && kernel_id <= (uint32_t)batch_boundaries[i]) {
             if (current_batch != i) {
                 current_batch = i;
@@ -124,11 +139,11 @@ void nvbit_at_init() {
     setenv("CUDA_MANAGED_FORCE_DEVICE_ALLOC", "1", 1);
 
     /* ADDED: Initialize batch boundaries */
-    batch_boundaries[0] = 753;
+    batch_boundaries[0] = 49;  // Batch 0 ends at kernel 49 (kernels 0-49)
     num_batches = 1;
-    int current_boundary = 753;
+    int current_boundary = 49;
     while (current_boundary < 16791 && num_batches < 100) {
-        current_boundary += 162;
+        current_boundary += 50;
         batch_boundaries[num_batches++] = current_boundary;
     }
 
@@ -220,36 +235,35 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
                     }
 
                     /* Extract destination register number from SASS */
-                    int dst_reg = 0;
-                    std::string sass = i->getSass();
-                    size_t r_pos = sass.find(" R");
-                    if (r_pos != std::string::npos) {
-                        try {
-                            std::string reg_str = sass.substr(r_pos + 2);
-                            size_t comma_pos = reg_str.find(",");
-                            if (comma_pos != std::string::npos) {
-                                reg_str = reg_str.substr(0, comma_pos);
-                                dst_reg = std::stoi(reg_str);
-                            }
-                        } catch (...) {
-                            dst_reg = 0;
-                        }
-                    }
+                    int num_opnds = i->getNumOperands();
+                    if (num_opnds == 0) continue;
+
+                    const InstrType::operand_t *op0 = i->getOperand(0);
+                    if (op0->type != InstrType::OperandType::REG) continue;
+
+                    int dst_reg = op0->u.reg.num;
 
                     /* Insert a call to "check_tensor_instr" before the instruction */
-                    nvbit_insert_call(i, "check_tensor_instr", IPOINT_BEFORE);
+                    // nvbit_insert_call(i, "select_nonzero_instr", IPOINT_BEFORE);
+                    nvbit_insert_call(i, "check_nonzero_simple", IPOINT_AFTER);
 
-                    if (exclude_pred_off) {
-                        nvbit_add_call_arg_guard_pred_val(i);
-                    } else {
-                        nvbit_add_call_arg_const_val32(i, 1);
-                    }
-                    nvbit_add_call_arg_const_val32(i, dst_reg);
-                    nvbit_add_call_arg_const_val64(i, (uint64_t)&batch_selected);
-                    nvbit_add_call_arg_const_val32(i, current_batch);
-                    nvbit_add_call_arg_const_val64(i, (uint64_t)&total_selected);
-                    nvbit_add_call_arg_const_val32(i, i->getIdx());
-                    nvbit_add_call_arg_const_val64(i, (uint64_t)kernel_id);
+                    // if (exclude_pred_off) {
+                    //     nvbit_add_call_arg_guard_pred_val(i);
+                    // } else {
+                    //     nvbit_add_call_arg_const_val32(i, 1);
+                    // }
+                    
+                    nvbit_add_call_arg_const_val32(i, dst_reg);              // Register number
+                    nvbit_add_call_arg_const_val32(i, current_batch);        // Batch ID
+                    nvbit_add_call_arg_const_val32(i, kernel_id);            // Kernel ID
+                    nvbit_add_call_arg_const_val32(i, i->getIdx());          // Instruction index
+                    
+                    // nvbit_add_call_arg_const_val32(i, dst_reg);                    // register number
+                    // nvbit_add_call_arg_const_val32(i, current_batch);              // batch ID
+                    // nvbit_add_call_arg_const_val32(i, kernel_id);                  // kernel ID  
+                    // nvbit_add_call_arg_const_val32(i, i->getIdx());                // instruction index
+                    // nvbit_add_call_arg_const_val64(i, (uint64_t)&batch_selected);  // batch flags array
+                    // nvbit_add_call_arg_const_val64(i, (uint64_t)&total_selected);  // total counter
                     
                 }
             }
